@@ -1559,6 +1559,9 @@ WINSCARDAPI LONG WINAPI PCSC_SCardState(SCARDHANDLE hCard,
 /*
  * PCSC returns a string but Windows SCardStatus requires the return to be a multi string.
  * Therefore extra length checks and additional buffer allocation is required
+ *
+ * pcchReaderLen passes mszReaderNames allocated buffer len in bytes, but expects to get
+ * mszReaderNames len in bytes on output (including trailing null-terminator)
  */
 WINSCARDAPI LONG WINAPI PCSC_SCardStatus_Internal(SCARDHANDLE hCard,
         LPSTR mszReaderNames, LPDWORD pcchReaderLen, LPDWORD pdwState,
@@ -1567,7 +1570,9 @@ WINSCARDAPI LONG WINAPI PCSC_SCardStatus_Internal(SCARDHANDLE hCard,
 	PCSC_SCARDHANDLE* pCard = NULL;
 	SCARDCONTEXT hContext;
 	LONG status;
-	PCSC_DWORD pcsc_cchReaderLen = 0;
+	PCSC_DWORD pcsc_cchReaderLen = 0; //gets reader buffer len from pcsc (without null-terminator)
+	size_t readerNamesCharNumWithTerminator = 0; //stores output reader name len with null-terminator in chars
+	size_t readerNamesNeededLen = 0; //stores needed for mszReaderNames output len in bytes
 	PCSC_DWORD pcsc_cbAtrLen = 0;
 	PCSC_DWORD pcsc_dwState = 0;
 	PCSC_DWORD pcsc_dwProtocol = 0;
@@ -1577,6 +1582,7 @@ WINSCARDAPI LONG WINAPI PCSC_SCardStatus_Internal(SCARDHANDLE hCard,
 	LPBYTE atr = pbAtr;
 	LPSTR tReader = NULL;
 	LPBYTE tATR = NULL;
+	size_t charSize = unicode ? sizeof(WCHAR) : sizeof(BYTE);
 
 	if (!g_PCSC.pfnSCardStatus)
 		return SCARD_E_NO_SERVICE;
@@ -1598,19 +1604,16 @@ WINSCARDAPI LONG WINAPI PCSC_SCardStatus_Internal(SCARDHANDLE hCard,
 	if (status != STATUS_SUCCESS)
 		return PCSC_MapErrorCodeToWinSCard(status);
 
-	pcsc_cchReaderLen++;
-
-	if (unicode)
-		pcsc_cchReaderLen *= 2;
+	/* add one to pcsc_cchReaderLen for trailing null-terminator */
+	readerNamesCharNumWithTerminator = (pcsc_cchReaderLen + 1);
+	readerNamesNeededLen = readerNamesCharNumWithTerminator * charSize;
 
 	if (pcchReaderLen)
 	{
 		if (*pcchReaderLen == SCARD_AUTOALLOCATE)
 			allocateReader = TRUE;
-		else if (mszReaderNames && (*pcchReaderLen < pcsc_cchReaderLen))
+		else if (mszReaderNames && (*pcchReaderLen < readerNamesNeededLen))
 			return SCARD_E_INSUFFICIENT_BUFFER;
-		else
-			pcsc_cchReaderLen = *pcchReaderLen;
 	}
 
 	if (pcbAtrLen)
@@ -1623,7 +1626,7 @@ WINSCARDAPI LONG WINAPI PCSC_SCardStatus_Internal(SCARDHANDLE hCard,
 			pcsc_cbAtrLen = *pcbAtrLen;
 	}
 
-	if (allocateReader && pcsc_cchReaderLen > 0 && mszReaderNames)
+	if (allocateReader && readerNamesNeededLen > 0 && mszReaderNames)
 	{
 #ifdef __MACOSX__
 
@@ -1631,10 +1634,10 @@ WINSCARDAPI LONG WINAPI PCSC_SCardStatus_Internal(SCARDHANDLE hCard,
 		     * Workaround for SCardStatus Bug in MAC OS X Yosemite
 		     */
 		if (OSXVersion == 0x10100000)
-			pcsc_cchReaderLen++;
+			readerNamesNeededLen++;
 
 #endif
-		tReader = calloc(1, pcsc_cchReaderLen);
+		tReader = calloc(1, readerNamesNeededLen);
 
 		if (!tReader)
 		{
@@ -1658,6 +1661,17 @@ WINSCARDAPI LONG WINAPI PCSC_SCardStatus_Internal(SCARDHANDLE hCard,
 		atr = tATR;
 	}
 
+	pcsc_cchReaderLen = readerNamesNeededLen;
+	if (!allocateReader && unicode)
+	/* we should locally allocate memory for reader names and free it when readerNames are converted */
+	{
+		readerNames = calloc(1, pcsc_cchReaderLen);
+		if (!readerNames)
+		{
+			status = ERROR_NOT_ENOUGH_MEMORY;
+			goto out_fail;
+		}
+	}
 	status = (LONG) g_PCSC.pfnSCardStatus(hCard, readerNames, &pcsc_cchReaderLen, &pcsc_dwState,
 	                                      &pcsc_dwProtocol, atr,
 	                                      &pcsc_cbAtrLen);
@@ -1665,38 +1679,48 @@ WINSCARDAPI LONG WINAPI PCSC_SCardStatus_Internal(SCARDHANDLE hCard,
 	if (status != STATUS_SUCCESS)
 		goto out_fail;
 
-	if (tATR)
+	if (!unicode)
+	/* add trailing null-character */
+	{
+		readerNames[pcsc_cchReaderLen] = '\0';
+		if (pcchReaderLen)
+			*pcchReaderLen = pcsc_cchReaderLen + 1;
+	}
+	else
+	/* convert to unicode, null-character presence is guaranteed by conversion function */
+	{
+		LPSTR mszConvertedReaderNamesW = (allocateReader ? mszReaderNames : NULL);
+		int allocatedReaderNamesLenW = (allocateReader ? *pcchReaderLen/sizeof(WCHAR) : 0);
+		int convertedReaderLenW = 0;
+		convertedReaderLenW = ConvertToUnicode(CP_UTF8, 0, readerNames, *pcchReaderLen,
+		                        (WCHAR**) &mszConvertedReaderNamesW, allocatedReaderNamesLenW);
+
+		if (convertedReaderLenW <= 0 || mszConvertedReaderNamesW == NULL)
+		{
+			status = ERROR_NOT_ENOUGH_MEMORY;
+			goto out_fail;
+		}
+
+		if (pcchReaderLen)
+			*pcchReaderLen = convertedReaderLenW;
+	
+		free(readerNames);
+		readerNames = mszConvertedReaderNamesW;
+	}
+
+
+	if (allocateAtr)
 	{
 		PCSC_AddMemoryBlock(hContext, tATR);
 		*(LPBYTE*)pbAtr = tATR;
 	}
 
-	if (tReader)
+	if (allocateReader)
 	{
-		if (unicode)
-		{
-			LPSTR mszReaderNamesW = NULL;
-			int pcsc_cchReaderLenW = 0;
-			pcsc_cchReaderLenW = ConvertToUnicode(CP_UTF8, 0, tReader, *pcchReaderLen,
-			                                      (WCHAR**) &mszReaderNamesW, 0);
-
-			if (pcsc_cchReaderLenW <= 0 || mszReaderNamesW == NULL)
-			{
-				status = ERROR_NOT_ENOUGH_MEMORY;
-				goto out_fail;
-			}
-
-			readerNames = mszReaderNamesW;
-			free(tReader);
-			PCSC_AddMemoryBlock(hContext, mszReaderNamesW);
-			*(LPSTR*) mszReaderNames = mszReaderNamesW;
-		}
-		else
-		{
-			PCSC_AddMemoryBlock(hContext, tReader);
-			*(LPSTR*) mszReaderNames = tReader;
-		}
+		PCSC_AddMemoryBlock(hContext, readerNames);
+		*(LPSTR*) mszReaderNames = readerNames;
 	}
+
 
 	pcsc_dwState &= 0xFFFF;
 
@@ -1709,30 +1733,12 @@ WINSCARDAPI LONG WINAPI PCSC_SCardStatus_Internal(SCARDHANDLE hCard,
 	if (pcbAtrLen)
 		*pcbAtrLen = (DWORD) pcsc_cbAtrLen;
 
-	if (pcchReaderLen)
-	{
-		if (unicode)
-			*pcchReaderLen = (pcsc_cchReaderLen + 1) * 2;
-		else
-			*pcchReaderLen = pcsc_cchReaderLen + 1;
-	}
-
-	/* Make sure the last byte is set */
-	if (readerNames)
-	{
-		if (unicode)
-		{
-			readerNames[pcsc_cchReaderLen * 2] = '\0';
-			readerNames[pcsc_cchReaderLen * 2 + 1] = '\0';
-		}
-		else
-			readerNames[pcsc_cchReaderLen] = '\0';
-	}
-
 	return status;
 out_fail:
-	free(tReader);
-	free(tATR);
+	if (tReader)
+		free(tReader);
+	if (tATR)
+		free(tATR);
 	return status;
 }
 
